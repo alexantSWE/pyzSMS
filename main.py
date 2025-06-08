@@ -1,164 +1,207 @@
+#!/usr/bin/env python3
+
 import subprocess
 import time
+import argparse
+import sys
+from typing import List, Optional
 
-def send_sms_via_adb(phone_number, message):
-    """
-    Attempts to send an SMS using ADB by launching the default messaging app.
-    Requires manual tap "Send" on the phone.
-    """
-    message_escaped = message.replace('"', '\\"').replace("'", "\\'").replace("`", "\\`").replace("$", "\\$")
+# --- UI Enhancements: ANSI Colors ---
+class Colors:
+    """A class to hold ANSI color codes for terminal output."""
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
-    # Check if phone_number is a list (for potential future group SMS, though not fully implemented here)
-    # For now, we expect a single string. If multiple numbers are given to this function directly,
-    # they should be comma-separated for the sms: URI, e.g., "sms:num1,num2"
-    # However, the main script will loop and call this function for each number individually for clarity.
-    uri_data = f'sms:{phone_number}'
+def print_color(color: str, message: str):
+    """Prints a message in the specified color."""
+    print(f"{color}{message}{Colors.ENDC}")
 
-    cmd = [
-        'adb', 'shell',
-        'am', 'start',
-        '-a', 'android.intent.action.SENDTO',
-        '-d', uri_data,
-        '--es', 'sms_body', '"{}"'.format(message_escaped),
-        '--ez', 'exit_on_sent', 'true'
-    ]
+# --- Core Logic ---
+class AdbSmsHelper:
+    """A helper class to interact with an Android device via ADB for sending SMS intents."""
 
-    print(f"\nExecuting command: {' '.join(cmd)}")
+    def __init__(self, adb_path: str = 'adb'):
+        self.adb_path = adb_path
 
-    try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = process.communicate(timeout=15)
+    def check_device_connection(self) -> bool:
+        """
+        Checks for connected and authorized ADB devices.
+        Returns True if at least one device is ready, False otherwise.
+        """
+        print_color(Colors.OKBLUE, "Checking for connected ADB devices...")
+        try:
+            result = subprocess.run(
+                [self.adb_path, 'devices'],
+                capture_output=True, text=True, check=True, timeout=10
+            )
+            device_lines = result.stdout.strip().split('\n')
+            # Filter for lines that represent an active, authorized device
+            connected_devices = [line for line in device_lines[1:] if line.strip() and "\tdevice" in line]
 
-        if process.returncode == 0:
-            print(f"SMS intent sent for {phone_number}. Check your phone to confirm sending.")
-            print("The app might close automatically after you tap send, or you might need to close it.")
-        else:
-            print(f"Error sending SMS intent for {phone_number}:")
-            if stdout:
-                print(f"STDOUT: {stdout.decode().strip()}")
-            if stderr:
-                print(f"STDERR: {stderr.decode().strip()}")
-        return process.returncode == 0
+            if not connected_devices:
+                print_color(Colors.FAIL, "\nError: No authorized Android device found.")
+                print("Please ensure that:")
+                print("1. Your phone is connected via USB.")
+                print("2. 'USB Debugging' is enabled in Developer Options.")
+                print("3. You have authorized this computer for debugging on your phone.")
+                return False
+            else:
+                print_color(Colors.OKGREEN, "\nFound connected device(s):")
+                for device in connected_devices:
+                    print(f"- {device.split()[0]}")
+                return True
 
-    except subprocess.TimeoutExpired:
-        print("ADB command timed out for {phone_number}. The intent might have launched, but confirmation wasn't received.")
-        if 'process' in locals() and process:
-            process.kill()
-        return False
-    except FileNotFoundError:
-        print("Error: ADB command not found. Is it installed and in your PATH?")
-        return False
-    except Exception as e:
-        print(f"An unexpected error occurred for {phone_number}: {e}")
-        return False
-
-def check_adb_device():
-    """Checks for connected and authorized ADB devices."""
-    try:
-        result = subprocess.run(['adb', 'devices'], capture_output=True, text=True, check=True, timeout=10)
-        device_lines = result.stdout.strip().split('\n')
-        connected_devices = [line for line in device_lines[1:] if line.strip() and "\tdevice" in line]
-
-        if not connected_devices:
-            print("\nNo authorized Android device found or device is offline. Please check:")
-            print("1. Phone is connected via USB.")
-            print("2. USB Debugging is enabled in Developer Options.")
-            print("3. You have authorized the computer for debugging on your phone.")
-            print("\nADB 'devices' output:")
-            print(result.stdout)
+        except FileNotFoundError:
+            print_color(Colors.FAIL, f"Error: The command '{self.adb_path}' was not found.")
+            print("Please install Android SDK Platform Tools and ensure 'adb' is in your system's PATH.")
             return False
-        else:
-            print("\nConnected devices:")
-            for device in connected_devices:
-                print(f"- {device.split()[0]}")
-            print("Proceeding...")
-            return True
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            print_color(Colors.FAIL, f"An error occurred while checking for ADB devices: {e}")
+            if hasattr(e, 'stderr'):
+                print(f"ADB Error Output: {e.stderr}")
+            return False
 
-    except FileNotFoundError:
-        print("ADB command not found. Please install Android SDK Platform Tools and add to PATH.")
-        return False
-    except subprocess.CalledProcessError as e:
-        print(f"Error checking ADB devices: {e.stderr}")
-        return False
-    except subprocess.TimeoutExpired:
-        print("ADB 'devices' command timed out. Ensure ADB is working correctly.")
-        return False
+    def send_sms_intent(self, phone_number: str, message: str) -> bool:
+        """
+        Sends an intent to the Android device to open the default messaging app
+        with the recipient and message pre-filled.
 
-if __name__ == "__main__":
-    print("--- ADB SMS Sender ---")
+        Args:
+            phone_number: The recipient's phone number.
+            message: The message body.
 
-    if not check_adb_device():
-        exit()
+        Returns:
+            True if the ADB command was sent successfully, False otherwise.
+        """
+        print(f"\nAttempting to open SMS composer for {Colors.OKCYAN}{phone_number}{Colors.ENDC}...")
+        
+        # The 'am start' command to open the SMS app.
+        # No extra quotes are needed around the message; subprocess handles arguments.
+        command = [
+            self.adb_path, 'shell', 'am', 'start',
+            '-a', 'android.intent.action.SENDTO',
+            '-d', f'sms:{phone_number}',
+            '--es', 'sms_body', message,
+            '--ez', 'exit_on_sent', 'true'
+        ]
 
-    # Get recipient numbers
+        try:
+            # Using Popen to get more control and avoid blocking indefinitely if the shell hangs
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout, stderr = process.communicate(timeout=15)
+
+            if process.returncode == 0:
+                print_color(Colors.OKGREEN, "Intent sent successfully! Please check your phone to tap 'Send'.")
+                return True
+            else:
+                print_color(Colors.FAIL, f"Error sending intent for {phone_number}.")
+                if stderr:
+                    # Often, the error message from 'am' is on stderr.
+                    print_color(Colors.FAIL, f"ADB Error: {stderr.strip()}")
+                else:
+                    print_color(Colors.WARNING, "ADB command failed with no specific error message.")
+                return False
+
+        except subprocess.TimeoutExpired:
+            print_color(Colors.FAIL, f"ADB command timed out for {phone_number}.")
+            return False
+        except Exception as e:
+            print_color(Colors.FAIL, f"An unexpected error occurred for {phone_number}: {e}")
+            return False
+
+def run_interactive_mode() -> tuple[List[str], str]:
+    """Runs the script in interactive mode, prompting the user for input."""
     while True:
-        recipient_input = input("\nEnter recipient phone number(s) (comma-separated for multiple, e.g., +123, +456): ").strip()
+        recipient_input = input(f"Enter recipient phone number(s) (comma-separated): ").strip()
         if not recipient_input:
-            print("Recipient number(s) cannot be empty. Please try again.")
+            print_color(Colors.WARNING, "Input cannot be empty. Please try again.")
             continue
-
-        # Split by comma and strip whitespace from each number
         recipient_numbers = [num.strip() for num in recipient_input.split(',') if num.strip()]
-
-        if not recipient_numbers:
-            print("No valid phone numbers entered. Please try again.")
-        else:
+        if recipient_numbers:
             break
+        else:
+            print_color(Colors.WARNING, "No valid phone numbers entered. Please try again.")
 
-    # Get message content
     while True:
         message_text = input("Enter the message content: ").strip()
         if message_text:
             break
         else:
-            print("Message content cannot be empty. Please try again.")
+            print_color(Colors.WARNING, "Message content cannot be empty.")
+    
+    return recipient_numbers, message_text
 
-    print("\n--- Summary ---")
-    print(f"Recipient(s): {', '.join(recipient_numbers)}")
-    print(f"Message: {message_text}")
+def main():
+    """Main function to parse arguments and execute the script."""
+    parser = argparse.ArgumentParser(
+        description="A CLI tool to send SMS messages via an ADB-connected Android device.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""
+Examples:
+  Interactive mode:
+    python main.py
 
-    confirm = input("Do you want to proceed? (y/n): ").strip().lower()
+  Direct mode:
+    python main.py -n "+15551234567" -m "Hello there!"
+    python main.py -n "+15551234567,+15557654321" -m "Group message" -d 10
+"""
+    )
+    parser.add_argument("-n", "--numbers", help="One or more recipient phone numbers, comma-separated.")
+    parser.add_argument("-m", "--message", help="The content of the SMS message.")
+    parser.add_argument("-d", "--delay", type=int, default=7, help="Delay in seconds between sending to multiple recipients (default: 7).")
+
+    args = parser.parse_args()
+
+    print_color(Colors.HEADER, "--- ADB SMS Sender ---")
+    print("Prepares SMS messages on your phone. You must tap 'Send' manually on the device.\n")
+
+    helper = AdbSmsHelper()
+    if not helper.check_device_connection():
+        sys.exit(1)
+
+    if args.numbers and args.message:
+        # Direct mode from arguments
+        recipient_numbers = [num.strip() for num in args.numbers.split(',')]
+        message_text = args.message
+        print("\nUsing provided arguments:")
+    else:
+        # Interactive mode
+        recipient_numbers, message_text = run_interactive_mode()
+        print("\n--- Summary ---")
+    
+    print(f"{Colors.BOLD}Recipient(s):{Colors.ENDC} {', '.join(recipient_numbers)}")
+    print(f"{Colors.BOLD}Message:{Colors.ENDC} \"{message_text}\"")
+    
+    confirm = input("Proceed? (y/n): ").strip().lower()
     if confirm != 'y':
-        print("Operation cancelled by user.")
-        exit()
+        print_color(Colors.WARNING, "Operation cancelled.")
+        sys.exit(0)
 
     successful_sends = 0
-    failed_sends = 0
+    total_sends = len(recipient_numbers)
 
     for i, number in enumerate(recipient_numbers):
-        print(f"\n--- Sending to recipient {i+1} of {len(recipient_numbers)}: {number} ---")
-        if send_sms_via_adb(number, message_text):
+        if helper.send_sms_intent(number, message_text):
             successful_sends += 1
-            print(f"SMS preparation for {number} initiated.")
-        else:
-            failed_sends += 1
-            print(f"SMS preparation for {number} failed.")
-
-        if i < len(recipient_numbers) - 1: # If not the last recipient
+        
+        if i < total_sends - 1:
             try:
-                # Wait for a few seconds to allow user to interact with the phone
-                # and for the messaging app to potentially close.
-                delay_seconds = 7
-                print(f"Waiting {delay_seconds} seconds before proceeding to the next recipient...")
-                print("Press Ctrl+C to skip waiting or stop.")
-                time.sleep(delay_seconds)
+                print_color(Colors.OKBLUE, f"\nWaiting {args.delay} seconds before next recipient. Press Ctrl+C to skip.")
+                time.sleep(args.delay)
             except KeyboardInterrupt:
-                print("\nSkipping wait. Proceeding to next recipient or finishing.")
-                # Optionally, ask if user wants to continue with next recipients or stop all
-                stop_all = input("Do you want to stop sending to remaining recipients? (y/n): ").strip().lower()
-                if stop_all == 'y':
-                    print("Stopping further message sends.")
-                    break # Exit the loop
-    
-    print("\n--- Sending Complete ---")
-    print(f"Successfully initiated SMS prep for: {successful_sends} recipient(s).")
-    print(f"Failed to initiate SMS prep for: {failed_sends} recipient(s).")
+                print_color(Colors.WARNING, "\nWait skipped by user.")
 
-    # Note on Group SMS:
-    # Some Android SMS apps might support sending to multiple recipients in one go
-    # if you format the 'sms:' URI like 'sms:number1,number2,number3'.
-    # This would open a group chat composer.
-    # To try this (experimental, app-dependent):
-    # 1. Modify the script to take all numbers as one string: `all_numbers_str = ",".join(recipient_numbers)`
-    # 2. Call `send_sms_via_adb(all_numbers_str, message_text)` only ONCE.
-    # This script uses individual sends for more predictable behavior across different SMS apps.
+    print_color(Colors.HEADER, "\n--- Task Complete ---")
+    print_color(Colors.OKGREEN, f"Successfully initiated: {successful_sends} of {total_sends} messages.")
+    if successful_sends < total_sends:
+        print_color(Colors.FAIL, f"Failed to initiate: {total_sends - successful_sends} of {total_sends} messages.")
+
+if __name__ == "__main__":
+    main()
